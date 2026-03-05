@@ -41,6 +41,13 @@ try:
 except ImportError:
     _BRIEFING_AVAILABLE = False
 
+# ── Optional: Platinum CEO audit ───────────────────────────────────────────────
+try:
+    from ceo_audit import CEOAudit as _CEOAudit
+    _AUDIT_AVAILABLE = True
+except ImportError:
+    _AUDIT_AVAILABLE = False
+
 # Force UTF-8 output on Windows
 if sys.stdout.encoding != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -296,6 +303,14 @@ class DashboardScheduler:
                     log(f"CEO briefing saved -> {path.name}")
                 except Exception as exc:
                     log(f"ERROR generating CEO briefing: {exc}")
+
+            if _AUDIT_AVAILABLE:
+                log("Generating Platinum CEO audit...")
+                try:
+                    path = _CEOAudit().run()
+                    log(f"CEO audit saved -> {path.name}")
+                except Exception as exc:
+                    log(f"ERROR generating CEO audit: {exc}")
 
             self._last_report_time = now
 
