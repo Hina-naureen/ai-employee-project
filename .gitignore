@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.env
+venv/
+.venv/
+env/
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Task vault — processed files (keep structure, ignore content)
+AI_Employee_Vault/Done/
+AI_Employee_Vault/Rejected/
+AI_Employee_Vault/Needs_Action/
+AI_Employee_Vault/Approved/
+AI_Employee_Vault/Inbox/
+
+# Keep Plans folder tracked (generated plans are useful)
+!AI_Employee_Vault/Plans/
