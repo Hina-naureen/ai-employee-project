@@ -1,10 +1,16 @@
 """
 filesystem_watcher.py
 ─────────────────────
-Bronze Tier — Personal AI Employee (Digital FTE)
+Silver Tier — Personal AI Employee (Digital FTE)
 
 Monitors the Inbox folder, triages incoming task files, generates AI-powered
 plans, enforces handbook policies, and archives completed work.
+
+Human-in-the-Loop (HITL) approval system:
+  - Sensitive tasks (payment, invoice, etc.) generate a PENDING_*.md file
+    inside AI_Employee_Vault/Pending_Approval/
+  - Human reviews the file and moves it to Approved/ or Rejected/
+  - The watcher detects the decision and finalises the task automatically
 
 Dependencies:
     pip install watchdog openai
@@ -44,6 +50,9 @@ except ImportError:
 
 # Silver Tier — AI classification layer
 from ai_processor import analyze_file
+
+# Silver Tier — Dashboard scheduler
+from scheduler import DashboardScheduler
 
 # ─────────────────────────────────────────────
 #  VAULT PATHS  — always resolved to absolute paths (critical on Windows)
@@ -499,6 +508,220 @@ def generate_plan(task_file: Path) -> Path:
 
 
 # ─────────────────────────────────────────────
+#  HUMAN-IN-THE-LOOP  (HITL) APPROVAL SYSTEM
+# ─────────────────────────────────────────────
+
+# Additional keywords that trigger the approval gate (beyond payment keywords)
+SENSITIVE_KEYWORDS = PAYMENT_KEYWORDS | {
+    "delete", "remove", "terminate", "fire", "legal", "lawsuit",
+    "contract", "confidential", "private", "sensitive",
+}
+
+
+def _detect_action(task_file: Path, task_text: str) -> tuple[str, str]:
+    """
+    Infer a human-readable action label and recipient hint from the task.
+    Returns (action, recipient).
+    """
+    corpus = (task_text + " " + task_file.name).lower()
+
+    if any(kw in corpus for kw in {"invoice", "payment", "pay", "transfer", "purchase"}):
+        action = "process_payment"
+    elif any(kw in corpus for kw in {"email", "send", "reply", "message"}):
+        action = "send_email"
+    elif any(kw in corpus for kw in {"contract", "legal", "sign"}):
+        action = "sign_or_execute_contract"
+    elif any(kw in corpus for kw in {"delete", "remove", "terminate"}):
+        action = "delete_or_terminate_resource"
+    else:
+        action = "review_and_execute"
+
+    # Try to find a recipient (email-like token)
+    import re as _re
+    email_match = _re.search(r"[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}", task_text)
+    recipient = email_match.group(0) if email_match else "(see task details)"
+
+    return action, recipient
+
+
+def generate_approval_request(task_file: Path) -> Path:
+    """
+    Generate a PENDING_<taskname>.md approval request inside Pending_Approval/.
+
+    The file contains:
+      - YAML front-matter with action, recipient, reason, status
+      - The original task content for human review
+      - Clear instructions: move to Approved/ or Rejected/
+
+    Returns the path to the written approval request file.
+    """
+    task_file = task_file.resolve()
+
+    try:
+        task_text = task_file.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        task_text = "(could not read task content)"
+
+    action, recipient = _detect_action(task_file, task_text)
+
+    # Determine the reason
+    corpus = (task_text + " " + task_file.name).lower()
+    if any(kw in corpus for kw in {"invoice", "payment", "pay"}):
+        reason = "Payment-related task detected — requires human authorisation"
+    elif any(kw in corpus for kw in {"contract", "legal"}):
+        reason = "Legal / contract action detected — requires human sign-off"
+    elif any(kw in corpus for kw in {"delete", "remove", "terminate"}):
+        reason = "Destructive action detected — requires human confirmation"
+    else:
+        reason = "Sensitive task detected — requires human review"
+
+    approval_name = f"PENDING_{task_file.stem}.md"
+    approval_path = PENDING_APPROVAL / approval_name
+
+    content = (
+        f"---\n"
+        f"type: approval_request\n"
+        f"action: {action}\n"
+        f"recipient: {recipient}\n"
+        f"reason: {reason}\n"
+        f"original_file: {task_file.name}\n"
+        f"requested_at: {now_str()}\n"
+        f"status: pending\n"
+        f"---\n"
+        f"\n"
+        f"## Task Details\n"
+        f"\n"
+        f"{task_text}\n"
+        f"\n"
+        f"## To Approve\n"
+        f"\n"
+        f"Move this file to:\n"
+        f"\n"
+        f"    AI_Employee_Vault/Approved/\n"
+        f"\n"
+        f"The task will be automatically marked as **Done**.\n"
+        f"\n"
+        f"## To Reject\n"
+        f"\n"
+        f"Move this file to:\n"
+        f"\n"
+        f"    AI_Employee_Vault/Rejected/\n"
+        f"\n"
+        f"The task will be automatically marked as **Rejected** and archived.\n"
+    )
+
+    PENDING_APPROVAL.mkdir(parents=True, exist_ok=True)
+
+    # Avoid collision
+    if approval_path.exists():
+        stem, suffix = approval_path.stem, approval_path.suffix
+        counter = 1
+        while approval_path.exists():
+            approval_path = PENDING_APPROVAL / f"{stem}_{counter}{suffix}"
+            counter += 1
+
+    approval_path.write_text(content, encoding="utf-8")
+    log(f"  [HITL]    Approval request created → {approval_path.name}")
+    return approval_path
+
+
+def _handle_approval_decision(raw_path: str, approved: bool) -> None:
+    """
+    Called when a human moves an approval file into Approved/ or Rejected/.
+
+    - Reads the original_file field from the YAML front-matter.
+    - Moves the original task file to Done/ (approved) or Rejected/ (rejected).
+    - Moves the approval request itself alongside the decision.
+    - Updates dashboard stats and activity log.
+    """
+    time.sleep(0.5)
+    decision_file = Path(raw_path).resolve()
+
+    if not decision_file.exists():
+        return
+    if is_temp_file(decision_file):
+        return
+
+    decision_label = "Approved" if approved else "Rejected"
+    log(f"\n{'─' * 55}")
+    log(f"  [HITL]    Decision detected: {decision_label} → {decision_file.name}")
+
+    # ── Parse the original_file from YAML front-matter ────────────────────────
+    import re as _re
+    try:
+        text = decision_file.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        log(f"  [HITL]    Could not read {decision_file.name} — skipping.")
+        return
+
+    match = _re.search(r"^original_file:\s*(.+)$", text, _re.MULTILINE)
+    original_filename = match.group(1).strip() if match else None
+
+    # ── Resolve where the original task file currently is ─────────────────────
+    original_file: Path | None = None
+    if original_filename:
+        candidate = PENDING_APPROVAL / original_filename
+        if candidate.exists():
+            original_file = candidate
+        else:
+            # Search the whole vault in case it was moved already
+            for folder in (NEEDS_ACTION, PLANS, DONE, REJECTED):
+                candidate = folder / original_filename
+                if candidate.exists():
+                    original_file = candidate
+                    break
+
+    # ── Route based on decision ───────────────────────────────────────────────
+    if approved:
+        if original_file and original_file.exists():
+            moved = safe_move(original_file, DONE)
+            log(f"  [HITL]    Original task moved to Done/ → {moved.name}")
+        safe_move(decision_file, DONE)
+        _stats["Completed Tasks"] += 1
+        _stats["Pending Tasks"]   = max(0, _stats["Pending Tasks"] - 1)
+        event_label = "Approved → Done"
+        log(f"  [HITL]    Task APPROVED and marked Done.")
+
+    else:
+        if original_file and original_file.exists():
+            moved = safe_move(original_file, REJECTED)
+            log(f"  [HITL]    Original task archived in Rejected/ → {moved.name}")
+        safe_move(decision_file, REJECTED)
+        _stats["Rejected Tasks"] += 1
+        _stats["Pending Tasks"]  = max(0, _stats["Pending Tasks"] - 1)
+        event_label = "Rejected → Archived"
+        log(f"  [HITL]    Task REJECTED and archived.")
+
+    dashboard_log_event(event_label, decision_file.name)
+    dashboard_update_stats()
+    log(f"{'─' * 55}\n")
+
+
+class ApprovalHandler(FileSystemEventHandler):
+    """
+    Watchdog handler that monitors both Approved/ and Rejected/ folders.
+
+    When a file is dropped into either folder (by the human reviewer),
+    it reads the approval request, finds the original task, and finalises it.
+    """
+
+    def __init__(self, approved: bool):
+        super().__init__()
+        self.approved = approved          # True = Approved/, False = Rejected/
+
+    def on_created(self, event):
+        if event.is_directory:
+            return
+        _handle_approval_decision(event.src_path, self.approved)
+
+    def on_moved(self, event):
+        """Catch atomic editor saves (rename-based moves into the folder)."""
+        if event.is_directory:
+            return
+        _handle_approval_decision(event.dest_path, self.approved)
+
+
+# ─────────────────────────────────────────────
 #  TASK PROCESSOR
 # ─────────────────────────────────────────────
 
@@ -516,16 +739,30 @@ def process_task(task_file: Path) -> None:
     # Step 1 — Generate AI plan
     generate_plan(task_file)
 
-    # Step 2 — Payment gate (policy override — runs before AI classification)
-    if is_payment_task(task_file):
-        dest = safe_move(task_file, PENDING_APPROVAL)
+    # Step 2 — Sensitive-task gate (runs before AI classification)
+    #           Generates a PENDING_*.md approval request for human review.
+    task_text_lower = ""
+    try:
+        task_text_lower = task_file.read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        pass
+
+    is_sensitive = (
+        any(kw in task_file.name.lower() for kw in SENSITIVE_KEYWORDS)
+        or any(kw in task_text_lower for kw in SENSITIVE_KEYWORDS)
+    )
+
+    if is_sensitive:
+        # Keep original task in Pending_Approval and generate approval request
+        safe_move(task_file, PENDING_APPROVAL)
+        generate_approval_request(PENDING_APPROVAL / task_file.name)
         _stats["Pending Tasks"] += 1
-        event_label = "Moved to Pending_Approval (payment gate)"
-        log(f"  [POLICY]  Payment task — routed to Pending_Approval.")
+        event_label = "Awaiting Human Approval (HITL)"
+        log(f"  [HITL]    Sensitive task — approval request generated.")
 
     else:
         # Step 3 — AI classification (Silver Tier)
-        target_name   = analyze_file(task_file)          # "Needs_Action" | "Plans" | "Done"
+        target_name   = analyze_file(task_file)     # "Needs_Action" | "Plans" | "Done"
         target_folder = BASE_DIR / target_name
 
         time.sleep(0.3)
@@ -665,24 +902,40 @@ def main() -> None:
 
     print("=" * 55)
     print("   Personal AI Employee — Digital FTE")
-    print("   Bronze Tier  |  AI-Powered Watcher")
+    print("   Silver Tier  |  AI + Human-in-the-Loop")
     print("=" * 55)
-    print(f"   Vault   : {BASE_DIR}")
-    print(f"   Watching: {INBOX}")
-    print(f"   AI Mode : {'OpenAI (' + OPENAI_MODEL + ')' if (_OPENAI_IMPORTABLE and OPENAI_API_KEY) else 'Local smart planner'}")
-    print(f"   Started : {now_str()}")
+    print(f"   Vault      : {BASE_DIR}")
+    print(f"   Inbox      : {INBOX}")
+    print(f"   Approvals  : {PENDING_APPROVAL}")
+    print(f"   AI Mode    : {'OpenAI (' + OPENAI_MODEL + ')' if (_OPENAI_IMPORTABLE and OPENAI_API_KEY) else 'Local smart planner'}")
+    print(f"   Started    : {now_str()}")
     print("=" * 55)
     print("   Drop task files into the Inbox/ folder.")
-    print("   Press Ctrl+C to stop the watcher.")
+    print("   Sensitive tasks → Pending_Approval/ (awaiting review).")
+    print("   Move PENDING_*.md to Approved/ or Rejected/ to decide.")
+    print("   Press Ctrl+C to stop.")
     print("=" * 55 + "\n")
 
     process_existing_inbox()
 
+    # Start dashboard scheduler in background (updates Dashboard.md every 60 min)
+    scheduler = DashboardScheduler()
+    scheduler.run_once()          # immediate first run on startup
+    scheduler.start_background()  # then every SCHEDULER_INTERVAL_MINUTES
+
     observer = Observer()
-    observer.schedule(InboxHandler(), str(INBOX), recursive=False)
+    # Watch Inbox for new tasks
+    observer.schedule(InboxHandler(),                   str(INBOX),            recursive=False)
+    # Watch Approved/ — human said yes
+    observer.schedule(ApprovalHandler(approved=True),   str(APPROVED),         recursive=False)
+    # Watch Rejected/ — human said no
+    observer.schedule(ApprovalHandler(approved=False),  str(REJECTED),         recursive=False)
     observer.start()
 
-    log("[WATCHER] Observer started. Listening for new files in Inbox/...")
+    log("[WATCHER] Observers started.")
+    log(f"[WATCHER]   Inbox     : {INBOX}")
+    log(f"[WATCHER]   Approved  : {APPROVED}")
+    log(f"[WATCHER]   Rejected  : {REJECTED}")
 
     try:
         while True:
