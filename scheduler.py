@@ -27,6 +27,20 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+# ── Optional: weekly report generator ─────────────────────────────────────────
+try:
+    from report_generator import ReportGenerator as _ReportGenerator
+    _REPORT_AVAILABLE = True
+except ImportError:
+    _REPORT_AVAILABLE = False
+
+# ── Optional: CEO briefing ─────────────────────────────────────────────────────
+try:
+    from ceo_briefing import CEOBriefing as _CEOBriefing
+    _BRIEFING_AVAILABLE = True
+except ImportError:
+    _BRIEFING_AVAILABLE = False
+
 # Force UTF-8 output on Windows
 if sys.stdout.encoding != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -43,8 +57,9 @@ DONE             = VAULT_DIR / "Done"
 DASHBOARD        = VAULT_DIR / "Dashboard.md"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-INTERVAL_MINUTES = int(os.environ.get("SCHEDULER_INTERVAL_MINUTES", "60"))
-INTERVAL_SECONDS = INTERVAL_MINUTES * 60
+INTERVAL_MINUTES        = int(os.environ.get("SCHEDULER_INTERVAL_MINUTES", "60"))
+INTERVAL_SECONDS        = INTERVAL_MINUTES * 60
+WEEKLY_REPORT_INTERVAL  = 7 * 24 * 60 * 60   # 7 days in seconds
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -243,12 +258,13 @@ class DashboardScheduler:
     """
 
     def __init__(self, interval_seconds: int = INTERVAL_SECONDS):
-        self.interval = interval_seconds
+        self.interval  = interval_seconds
         self._running  = False
         self._thread: threading.Thread | None = None
+        self._last_report_time: float = 0.0   # epoch seconds of last weekly report
 
     def run_once(self) -> None:
-        """Perform a single scan-and-write cycle."""
+        """Perform a single scan-and-write cycle (dashboard + optional weekly report)."""
         log("Running scheduled dashboard update...")
         try:
             stats = collect_stats()
@@ -260,7 +276,28 @@ class DashboardScheduler:
                 f"Rejected={len(stats['rejected'])}"
             )
         except Exception as exc:
-            log(f"ERROR during update: {exc}")
+            log(f"ERROR during dashboard update: {exc}")
+
+        # ── Weekly report + CEO briefing (every 7 days) ───────────────────────
+        now = time.time()
+        if now - self._last_report_time >= WEEKLY_REPORT_INTERVAL:
+            if _REPORT_AVAILABLE:
+                log("Generating weekly productivity report...")
+                try:
+                    path = _ReportGenerator().run()
+                    log(f"Weekly report saved -> {path.name}")
+                except Exception as exc:
+                    log(f"ERROR generating weekly report: {exc}")
+
+            if _BRIEFING_AVAILABLE:
+                log("Generating CEO briefing...")
+                try:
+                    path = _CEOBriefing().run()
+                    log(f"CEO briefing saved -> {path.name}")
+                except Exception as exc:
+                    log(f"ERROR generating CEO briefing: {exc}")
+
+            self._last_report_time = now
 
     def start(self) -> None:
         """
